@@ -2,7 +2,7 @@
 
 ## Authentication
 - **Supabase Auth** (email + password). Passwords are hashed by Supabase (bcrypt); nothing is stored in plaintext. Minimum length is 8 (`supabase/config.toml`).
-- Sessions: the website uses supabase-js browser storage. The app uses `expo-sqlite` storage with auto-refresh paused while backgrounded. The dashboard uses supabase-js browser storage.
+- Sessions: the website uses supabase-js browser storage. The app uses AsyncStorage, with auto-refresh paused while backgrounded. The dashboard uses supabase-js browser storage.
 - Password reset: `resetPasswordForEmail()`. The redirect URLs allowed are listed in `config.toml` (website, dashboard, `lifelink://` app scheme).
 - New users: the `handle_new_user` trigger creates `profiles`, `notification_preferences` and, for donors with blood group + city, a `donors` row. If a website-approved donor with the same email exists, it is **linked** instead of duplicated.
 
@@ -58,7 +58,7 @@ Roles live in `user_roles` and are checked **in Postgres** by `is_admin()`, `is_
 ## Secrets
 - Clients get **only** the project URL and the publishable (anon) key. Both are designed to be public; RLS is what protects data.
 - The service-role/secret key and the database password stay in the Supabase dashboard and your own terminal. They must never be pasted in chat, committed or shipped in a client.
-- `.env*` files are git-ignored. Only `*.example` files are committed.
+- `.env*.local` files are git-ignored. The app's `.env` holds only the public URL and publishable key; EAS cloud builds need it, so it must not be git-ignored.
 
 ## Verified behaviour
-`npm run test:db` runs 64 checks against the real migrations (PGlite). It covers anonymous access denials, column-level protection, cross-user isolation, the status workflow, admin-only operations, suspension, rate limits, donor de-duplication, notifications and audit logging.
+`npm run test:db` runs 88 checks against the real migrations (PGlite). It covers anonymous access denials, column-level protection, cross-user isolation, the status workflow, admin-only operations, suspension, rate limits, donor de-duplication, notifications and audit logging.

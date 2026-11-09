@@ -584,11 +584,11 @@ end $$;
 -- REQUEST STATUS TRANSITIONS (staff + requester)
 -- ============================================================================
 --   pending  → approved | rejected | cancelled
---   approved → active | rejected | cancelled
+--   approved → active | fulfilled | rejected | cancelled
 --   active   → fulfilled | cancelled
 --   fulfilled / rejected / cancelled are terminal
 -- Staff (admin/moderator): every transition above.
--- Requester (own request): pending|approved|active → cancelled, active → fulfilled.
+-- Requester (own request): pending|approved|active → cancelled, approved|active → fulfilled.
 create or replace function public.transition_request_status(
   _request_id uuid, _to public.request_status, _reason text default null
 ) returns public.request_status
@@ -606,7 +606,7 @@ begin
 
   _allowed := case _req.status
     when 'pending'  then _to in ('approved', 'rejected', 'cancelled')
-    when 'approved' then _to in ('active', 'rejected', 'cancelled')
+    when 'approved' then _to in ('active', 'fulfilled', 'rejected', 'cancelled')  -- published requests accept donors, so they can be fulfilled
     when 'active'   then _to in ('fulfilled', 'cancelled')
     else false end;
   if not _allowed then
@@ -615,7 +615,7 @@ begin
 
   if not _staff then
     if _req.requester_id is distinct from _uid then perform public._fail('You can only update your own requests.', '42501'); end if;
-    if not (_to = 'cancelled' or (_to = 'fulfilled' and _req.status = 'active')) then
+    if not (_to = 'cancelled' or (_to = 'fulfilled' and _req.status in ('approved', 'active'))) then
       perform public._fail('Only admins can approve or reject requests.', '42501');
     end if;
   end if;
@@ -676,7 +676,10 @@ declare
 begin
   select * into _a from public.donor_applications where id = _application_id for update;
   if not found then perform public._fail('Application not found.', 'P0002'); end if;
-  if _a.status <> 'pending' then perform public._fail('This application has already been reviewed.'); end if;
+  -- pending → approved/declined; a declined application may be reconsidered (approved) later.
+  if _a.status = 'approved' or (_a.status = 'declined' and not _approve) then
+    perform public._fail('This application has already been reviewed.');
+  end if;
 
   if _approve then
     select id into _profile from public.profiles where email = _a.email;

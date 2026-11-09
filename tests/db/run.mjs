@@ -182,6 +182,72 @@ await expectErr('non-admin cannot grant roles', () => q(`select public.admin_set
 check('roles: user cannot read others roles', (await q('select * from public.user_roles')).length === 0);
 check('notifications: user only sees own', (await q('select distinct user_id from public.notifications')).every((r) => r.user_id === AHMED));
 
+// ── 8. Client read models (migration 0007) ──────────────────────────────────
+await as('anon');
+const hosp = (await q('select public.list_hospitals() h'))[0].h;
+check('client api: anon lists hospitals with inventory', hosp.length >= 8 && Object.keys(hosp[0].inventory).length === 8);
+await expectErr('client api: anon cannot list request feed', () => q(`select public.list_requests()`), /sign in|permission denied/i);
+await expectErr('client api: anon cannot call admin_list_requests', () => q(`select public.admin_list_requests()`), /permission denied|Admin/);
+await as('authenticated', AHMED);
+const feed = (await q(`select public.list_requests() f`))[0].f;
+check('client api: feed hides other users pending requests', !feed.some((r) => r.status === 'pending' && !r.is_mine));
+check('client api: feed includes contact for signed-in users', feed.length > 0 && 'contact_phone' in feed[0]);
+const prof = (await q('select public.get_my_profile() p'))[0].p;
+check('client api: get_my_profile returns own profile + donor', prof.email === 'ahmed.raza@email.com' && !!prof.donor);
+await expectOk('client api: update_my_profile changes city by name', () => q(`select public.update_my_profile($1)`, [JSON.stringify({ city: 'Lahore', area: 'Gulberg' })]));
+check('client api: donor city synced to profile city',
+  (await q(`select (select public.get_my_profile())->>'city' c`))[0].c === 'Lahore');
+await expectErr('client api: update_my_profile rejects bad phone', () => q(`select public.update_my_profile($1)`, [JSON.stringify({ phone: 'abc' })]), /valid phone/);
+check('client api: badges list with progress', (await q('select jsonb_array_length(public.list_my_badges()) n'))[0].n === 6);
+await expectErr('client api: user cannot list admin donors', () => q(`select public.admin_list_donors()`), /Admin access/);
+await expectErr('client api: user cannot create hospital', () => q(`select public.admin_upsert_hospital($1)`, [JSON.stringify({ name: 'Fake Hospital', type: 'private', address: 'Somewhere 1', city: 'Karachi' })]), /Admin access/);
+await expectErr('client api: user cannot broadcast', () => q(`select public.admin_send_notification('all','Hi','There')`), /Admin access/);
+await as('authenticated', ADMIN);
+const al = (await q(`select public.admin_list_requests(_source => 'website') r`))[0].r;
+check('admin api: filter requests by source', al.total >= 1 && al.rows.every((r) => r.source === 'website'));
+const det = (await q(`select public.admin_get_request($1) d`, [web[0].id]))[0].d;
+check('admin api: request details include history + responses', det.history.length === 3 && det.responses.length === 1, JSON.stringify({ h: det.history.length, r: det.responses.length }));
+const dl = (await q(`select public.admin_list_donors(_blood_group => 'O+') d`))[0].d;
+check('admin api: donor list filtered by blood group', dl.total >= 2 && dl.rows.every((d) => d.blood_group === 'O+'));
+const ul = (await q(`select public.admin_list_users(_role => 'admin') u`))[0].u;
+check('admin api: users filtered by role', ul.total === 1 && ul.rows[0].roles.includes('admin'));
+const newH = await expectOk('admin api: create hospital', async () => (await q(`select public.admin_upsert_hospital($1) id`, [JSON.stringify({ name: 'Test General Hospital', type: 'public', address: 'Main Road 12', city: 'Sukkur', has_blood_bank: true })]))[0].id);
+check('admin api: new hospital gets 8 inventory rows', (await q('select count(*)::int n from public.hospital_inventory where hospital_id=$1', [newH]))[0].n === 8);
+await expectOk('admin api: edit hospital', () => q(`select public.admin_upsert_hospital($1)`, [JSON.stringify({ id: newH, name: 'Test General Hospital', type: 'public', address: 'Main Road 14', city: 'Sukkur', beds: 120 })]));
+const sent = (await q(`select public.admin_send_notification('donors','Drive','Blood drive Saturday', _city => 'Karachi') n`))[0].n;
+check('admin api: broadcast reaches Karachi donors', sent >= 2, `sent=${sent}`);
+check('admin api: activity log readable', (await q(`select jsonb_array_length(public.admin_list_logs('activity')) n`))[0].n > 0);
+check('admin api: audit log readable', (await q(`select jsonb_array_length(public.admin_list_logs('audit', 'blood_requests')) n`))[0].n > 0);
+await expectOk('admin api: delete request', () => q(`select public.admin_delete_request($1)`, [kr[0].id]));
+
+// ── 9. Donor profile completion (migration 0008) ────────────────────────────
+// A website sign-up as "donor" carries no blood group / city, so no donor record
+// exists until the profile is completed. Completing it must list the donor, even
+// when the save does not include account_type, and must never duplicate it.
+await as('postgres');
+const newAuthUser = async (email, meta) => (await q(
+  `insert into auth.users (id, email, raw_user_meta_data, instance_id, aud, role)
+   values (gen_random_uuid(), $1, $2, '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated') returning id`,
+  [email, JSON.stringify(meta)]))[0].id;
+const donorRows = async (id) => q('select blood_group from public.donors where profile_id = $1', [id]);
+const WEBD = await newAuthUser('site.donor@example.com', { first_name: 'Site', last_name: 'Donorperson', user_type: 'donor' });
+const RECP = await newAuthUser('site.recipient@example.com', { first_name: 'Site', last_name: 'Recipient', user_type: 'recipient' });
+check('0008: website donor sign-up has no donor record yet', (await donorRows(WEBD)).length === 0);
+await as('authenticated', WEBD);
+await expectOk('0008: profile save without account_type adds blood group + city', () =>
+  q(`select public.update_my_profile($1)`, [JSON.stringify({ blood_group: 'A-', city: 'Multan', area: 'Cantt' })]));
+let wd = await donorRows(WEBD);
+check('0008: donor record created once blood group + city are known', wd.length === 1 && wd[0].blood_group === 'A-', JSON.stringify(wd));
+const listedW = await q(`select * from public.search_donors(_query => 'Donorperson')`);
+check('0008: completed website donor appears in donor search', listedW.length === 1 && listedW[0].city === 'Multan', JSON.stringify(listedW));
+await expectOk('0008: saving the profile again', () => q(`select public.update_my_profile($1)`, [JSON.stringify({ area: 'Cantt Bazaar', account_type: 'donor' })]));
+check('0008: no duplicate donor record', (await donorRows(WEBD)).length === 1);
+await as('authenticated', RECP);
+await expectOk('0008: recipient saves blood group + city', () => q(`select public.update_my_profile($1)`, [JSON.stringify({ blood_group: 'B+', city: 'Quetta' })]));
+check('0008: recipient accounts are not listed as donors', (await donorRows(RECP)).length === 0);
+await as('anon');
+await expectErr('0008: anon cannot call update_my_profile', () => q(`select public.update_my_profile('{}')`), /permission denied/);
+
 // ── report ──────────────────────────────────────────────────────────────────
 await as('postgres');
 const pass = results.filter((r) => r[0] === 'PASS').length;

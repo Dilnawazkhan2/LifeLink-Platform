@@ -1,8 +1,11 @@
-// Copy to the website folder as `config.js` and fill in the PUBLIC values.
-// Only the project URL and the publishable (anon) key belong here.
-// NEVER put the service-role / secret key or database password in this file.
-window.LIFELINK_CONFIG = {
-  SUPABASE_URL: 'http://127.0.0.1:54321',            // or https://<project-ref>.supabase.co
-  SUPABASE_PUBLISHABLE_KEY: '<publishable-or-anon-key>',
-  ADMIN_DASHBOARD_URL: 'http://127.0.0.1:5173',
-};
+// The website reads its settings from "LifeLink Website/LifeLink Web/config.js".
+// Edit the PRODUCTION block in that file:
+//
+//   var PRODUCTION = {
+//     supabaseUrl: 'https://YOUR-PROJECT-REF.supabase.co',
+//     supabaseAnonKey: 'YOUR-SUPABASE-PUBLISHABLE-OR-ANON-KEY',
+//   };
+//
+// Only the project URL and the publishable (anon) key belong there.
+// NEVER put the service_role / secret key or the database password in any website file.
+// On localhost the site automatically uses the local dev server (npm run dev).

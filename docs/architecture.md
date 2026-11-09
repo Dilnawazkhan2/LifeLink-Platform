@@ -18,10 +18,10 @@ One Supabase project is the **only** backend for all three clients.
               publishable key │ + user JWT            │                     │ user JWT (admin role
                               │                       │                     │ checked in Postgres)
              ┌────────────────┴─────┐   ┌─────────────┴────────┐   ┌────────┴──────────────┐
-             │ LifeDrop website     │   │ LifeLink Android     │   │ Admin dashboard        │
-             │ static HTML/JS       │   │ Expo SDK 58          │   │ React + Vite + TS      │
-             │ db.js → supabase-js  │   │ store → services →   │   │ (Phase 4, this repo:   │
-             │ (CDN), same UI       │   │ supabase-js          │   │  admin/)               │
+             │ LifeLink website     │   │ LifeLink Android     │   │ Admin dashboard        │
+             │ static HTML/JS       │   │ Expo SDK 58          │   │ admin.html + admin.js  │
+             │ db.js → supabase-js  │   │ store → services →   │   │ in the LifeLink site,  │
+             │ (CDN), same UI       │   │ supabase-js          │   │ behind a login gate    │
              └──────────────────────┘   └──────────────────────┘   └───────────────────────┘
 ```
 
@@ -43,20 +43,20 @@ LifeLink Platform/
     migrations/                ordered SQL migrations (schema, RLS, RPC, realtime, storage)
     seeds/reference.sql        partner hospitals + starting inventory (reviewable for prod)
     seeds/dev_demo.sql         DEV ONLY: demo accounts, requests, donations
-  tests/db/                    PGlite harness: applies migrations + 64 RLS/workflow checks
+  tests/db/                    PGlite harness: applies migrations + 88 RLS/workflow/API checks
   docs/                        architecture, database, security, API, setup
   env/                         example config for each client
-  admin/                       (Phase 4) admin dashboard
-  shared/                      (Phase 3+) generated DB types shared by admin + app
+  dev-server/                 local Supabase-compatible API on PGlite (no Docker) + website server
+  tests/e2e/, tests/cloud/     cross-client scenario tests, post-deploy verifier
 ```
 
 ## Client integration summary
 
 | Client | How it connects | What changes |
 |---|---|---|
-| Website | `<script>` for supabase-js (CDN) + `config.js` + rewritten `db.js` internals | No HTML/CSS/layout change. Forms call RPCs, auth uses Supabase Auth, donor search uses `search_donors`, output is HTML-escaped. `admin.html` redirects to the dashboard. |
-| Android app | `@supabase/supabase-js` + `expo-sqlite` session storage (Expo-documented setup) | `src/services/*` call Supabase; the store loads from the backend; mock data stays only behind an explicit demo flag |
-| Admin dashboard | supabase-js with the admin's own JWT | New app; all privileged actions are RPCs that check `is_admin()` / `is_staff()` server-side |
+| Website | vendored supabase-js (`vendor/supabase-2.118.0.js`) + `config.js` + rewritten `db.js` internals | No HTML/CSS/layout change. Forms call RPCs, auth uses Supabase Auth, donor search uses `search_donors`, output is HTML-escaped. `admin.html` is the admin dashboard (same design) behind a login gate; logic in `admin.js`. |
+| Android app | `@supabase/supabase-js` + AsyncStorage session storage (already a dependency; works on Android, iOS and web) | `src/services/*` call Supabase; the store loads from the backend; mock data only when `EXPO_PUBLIC_SUPABASE_URL` is unset/`demo` |
+| Admin dashboard | supabase-js with the admin's own JWT | `admin.html` (existing page, extended); all privileged actions are RPCs that check `is_admin()` / `is_staff()` server-side |
 
 ## Request lifecycle
 

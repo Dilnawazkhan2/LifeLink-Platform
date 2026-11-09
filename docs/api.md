@@ -21,12 +21,17 @@ All clients use supabase-js. "RPC" means `supabase.rpc(name, args)`. Errors come
 | `list_public_requests` | `_blood_group?, _city?, _urgent_only?, _include_fulfilled?, _limit?, _offset?` | published requests **without contact** | anonymous listings |
 | `public_stats` | — | `{donors, available_donors, hospitals, cities, lives_saved, open_requests}` | optional |
 
-Hospitals and inventory are plain table reads: `from('hospitals').select('*, cities(name), hospital_inventory(blood_group, units)')`.
+| `list_hospitals` | `_city?, _id?` | hospitals with city name and an `inventory` object (`{"O+": 12, …}`); admins also see inactive ones | admin dashboard, app Hospitals |
+| `get_donor_details` | `_donor_id` | public donor profile incl. age, about, member since (no contact) | app donor profile |
 
 ## Signed-in users
 
 | RPC / table | Purpose |
 |---|---|
+| `get_my_profile()` | Profile + city name + roles + donor (availability, rating) + notification preferences |
+| `update_my_profile(p jsonb)` | Edit own profile: `full_name, phone, blood_group, city` (name), `area, account_type, date_of_birth, gender, weight_kg, avatar_path, hours, about`. Keeps the donor row in sync. A donor account (donor / both) gets its donor record as soon as it has a blood group and a city, whichever fields the save includes (migration 0008); errors are not swallowed |
+| `list_requests(_scope 'feed'/'mine', _id?, _limit?)` | App feed: published + own requests, with `city`, `responded_count`, `is_mine`, `my_response` and contact details |
+| `list_my_donations()`, `list_my_badges()` | Donation history (with city); all badges with `earned_at` / `progress` |
 | `get_my_summary()` | Home/Profile header: donations, lives saved, accepted, my requests, open + urgent counts, unread, badges, availability, last donation, next eligible, `is_admin`, `is_staff` |
 | `from('profiles').update({...}).eq('id', me)` | Edit own profile (allowed columns only) |
 | `register_as_donor(_blood_group?, _city?, _area?)` | Become a donor |
@@ -45,6 +50,15 @@ Hospitals and inventory are plain table reads: `from('hospitals').select('*, cit
 | RPC | Role |
 |---|---|
 | `admin_dashboard_stats()` | staff |
+| `admin_list_requests(_status?, _source?, _blood_group?, _city?, _search?, _urgency?, _limit?, _offset?)` → `{total, rows}` | staff |
+| `admin_get_request(_id)` → request + requester + status history + donor responses | staff |
+| `admin_list_donors(_search?, _blood_group?, _availability?, _active?, _limit?, _offset?)` → `{total, rows}` (incl. contact) | staff |
+| `admin_list_users(_search?, _role?, _status?, _limit?, _offset?)` → `{total, rows}` (incl. roles) | staff |
+| `admin_list_applications(_status?, _search?, _limit?)` | staff |
+| `admin_list_logs(_kind 'activity'/'audit', _table?, _limit?, _offset?)` | admin |
+| `admin_upsert_hospital(p jsonb)` → id. Create: admin. Edit: admin or that hospital's staff. New hospitals get 8 inventory rows | admin / hospital staff |
+| `admin_delete_request(_id)`, `admin_delete_application(_id)` (reviewed applications only) | admin |
+| `admin_send_notification(_audience 'user'/'donors'/'all', _title, _body, _user_id?, _city?, _blood_group?)` → number of recipients | staff |
 | `transition_request_status(id, to, reason)` | staff: approve, reject (reason required), activate, fulfil, cancel |
 | `admin_review_donor_application(id, approve, note?)` | staff |
 | `admin_set_donor_active(id, active, reason?)` / `admin_set_donor_availability(id, status)` | staff |
@@ -76,6 +90,7 @@ pending ──approve──▶ approved ──activate──▶ active ──ful
 | pending → approved / rejected | ✓ (reject needs reason) | — |
 | pending → cancelled | ✓ | ✓ |
 | approved → active / rejected | ✓ | — |
+| approved → fulfilled (published requests already accept donors) | ✓ | ✓ |
 | approved → cancelled | ✓ | ✓ |
 | active → fulfilled | ✓ | ✓ |
 | active → cancelled | ✓ | ✓ |
@@ -117,7 +132,7 @@ Side effects of every transition (trigger):
 
 Realtime applies the same RLS, so a subscriber only receives rows it is allowed to select. Clients always do an initial fetch and support pull-to-refresh / reload; realtime only patches loaded data.
 
-## Website `LifeDropDB` → backend mapping (Phase 5)
+## Website `LifeLinkDB` → backend mapping (Phase 5)
 
 | Existing call | New implementation |
 |---|---|
@@ -128,7 +143,7 @@ Realtime applies the same RLS, so a subscriber only receives rows it is allowed 
 | `requests.create` | `rpc('submit_blood_request')` |
 | `messages.create` | `rpc('submit_contact_message')` |
 | `donors.search` / `getAll` | `rpc('search_donors', { _available_only: true })`; phone shown only to signed-in users via `get_donor_contact` |
-| `admin.html` | redirects to the admin dashboard |
+| `admin.html` | Is the admin dashboard (same dark design) behind a login gate; logic in `admin.js`; every action is an RPC re-checked in Postgres |
 
 ## App store action → backend mapping (Phase 6)
 
@@ -139,8 +154,8 @@ Realtime applies the same RLS, so a subscriber only receives rows it is allowed 
 | setAvailability | `set_my_availability` |
 | createRequest | `submit_blood_request` (`source: 'android'`) |
 | respondToRequest / withdrawResponse | `respond_to_request` / `withdraw_response` |
-| markRequestFulfilled / deleteRequest | `transition_request_status(…, 'fulfilled' \| 'cancelled')` |
+| markRequestFulfilled / deleteRequest | `transition_request_status(…, 'fulfilled' \| 'cancelled')`  (users cancel; only admins hard-delete) |
 | recordDonation | `record_donation` |
 | notification actions | `notifications` table + `mark_all_notifications_read` |
 | updateSettings | `notification_preferences.update` |
-| donors / hospitals screens | `search_donors`, `get_donor_public`, `hospitals` + `hospital_inventory` |
+| donors / hospitals screens | `search_donors`, `get_donor_details`, `get_donor_contact` (signed-in, logged), `list_hospitals` |
