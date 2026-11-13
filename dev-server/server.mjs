@@ -53,6 +53,9 @@ function verifyJwt(token) {
   } catch { return null; }
 }
 export const ANON_KEY = signJwt({ iss: 'lifelink-dev', role: 'anon', iat: 1762646400, exp: 2077920000 });
+// Dev-only service-role key (bypasses RLS), used by tests to run the Edge Function's delivery logic
+// against this server. Like the anon key it only works here: the secret is a public dev constant.
+export const SERVICE_ROLE_KEY = signJwt({ iss: 'lifelink-dev', role: 'service_role', iat: 1762646400, exp: 2077920000 });
 const ACCESS_TTL = 3600;
 
 // ── Database ─────────────────────────────────────────────────────────────────
@@ -135,6 +138,7 @@ function callerContext(req, { requireKey = true } = {}) {
   const apikey = req.headers.apikey ?? new URL(req.url, 'http://x').searchParams.get('apikey');
   const bearer = (req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
   const claims = verifyJwt(bearer);
+  if (claims?.role === 'service_role' && apikey === SERVICE_ROLE_KEY) return { role: 'service_role', sub: null, claims };
   if (requireKey && apikey !== ANON_KEY && !(claims?.role === 'anon')) {
     throw Object.assign(new Error('Invalid API key'), { status: 401, code: 'PGRST301' });
   }
@@ -479,7 +483,7 @@ const api = http.createServer(async (req, res) => {
     if (url.pathname.startsWith('/storage/v1/')) return await handleStorage(req, res, url);
     if (url.pathname === '/dev/mailbox') return send(res, 200, mailbox.slice(0, 20));
     if (url.pathname === '/' || url.pathname === '/dev') {
-      return send(res, 200, { name: 'LifeLink local dev server', supabaseUrl: `http://127.0.0.1:${PORT}`, anonKey: ANON_KEY, website: `http://127.0.0.1:${WEB_PORT}` });
+      return send(res, 200, { name: 'LifeLink local dev server', supabaseUrl: `http://127.0.0.1:${PORT}`, anonKey: ANON_KEY, serviceRoleKeyDevOnly: SERVICE_ROLE_KEY, website: `http://127.0.0.1:${WEB_PORT}` });
     }
     send(res, 404, { message: 'Not found' });
   } catch (e) {

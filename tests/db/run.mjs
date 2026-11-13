@@ -248,6 +248,159 @@ check('0008: recipient accounts are not listed as donors', (await donorRows(RECP
 await as('anon');
 await expectErr('0008: anon cannot call update_my_profile', () => q(`select public.update_my_profile('{}')`), /permission denied/);
 
+// ── 10. GPS locations, nearby donors, emergency alerts (migration 0009) ─────
+// Request point: Karachi city centre. D1 ≈3 km (O-), D2 ≈3 km (A+, incompatible
+// with B+), D3 ≈40 km (B+), D4 ≈2 km (opts out again), D5 ≈2 km (O+, no device).
+await as('postgres');
+const appUser = (email, group) => newAuthUser(email, { full_name: email.split('@')[0].replace('.', ' '), account_type: 'both', blood_group: group, city: 'Karachi', area: 'Saddar' });
+const D1 = await appUser('geo.one@example.com', 'O-');
+const D2 = await appUser('geo.two@example.com', 'A+');
+const D3 = await appUser('geo.three@example.com', 'B+');
+const D4 = await appUser('geo.four@example.com', 'O+');
+const D5 = await appUser('geo.five@example.com', 'O+');
+const RQ = await appUser('geo.requester@example.com', 'AB+');
+const REC = await newAuthUser('geo.recipient@example.com', { full_name: 'Geo Recipient', account_type: 'recipient', blood_group: 'A-', city: 'Karachi' });
+const KHI = { lat: 24.8607, lng: 67.0011 };
+const pref = async (id) => (await q('select nearby_discovery from public.notification_preferences where user_id = $1', [id]))[0].nearby_discovery;
+check('0009: nearby discovery is off by default (explicit opt-in)', (await pref(D1)) === false);
+await as('authenticated', D1);
+await expectErr('0009: location cannot be shared before opting in', () => q('select public.set_my_location(24.87, 67.03)'), /Share Approximate Location/);
+const optIn = async (id, lat, lng) => { await as('authenticated', id); await q('select public.set_nearby_discovery(true)'); await q('select public.set_my_location($1, $2, 25, $3)', [lat, lng, 'gps']); };
+await expectOk('0009: opted-in donor shares GPS location', () => optIn(D1, 24.8700, 67.0300));
+await optIn(D2, 24.8650, 67.0290);
+await optIn(D3, 25.2100, 67.1000);
+await optIn(D4, 24.8500, 67.0100);
+await optIn(D5, 24.8550, 67.0150);
+await as('authenticated', REC);
+await q('select public.set_nearby_discovery(true)');
+await expectErr('0009: recipient accounts cannot share a location', () => q('select public.set_my_location(24.86, 67.0)'), /Only donor accounts/);
+await as('authenticated', D2);
+check('0009: other users cannot read a donor location', (await q('select * from public.donor_locations')).length === 1, 'should only see own row');
+await as('authenticated', D4);
+await q('select public.set_nearby_discovery(false)');
+await as('postgres');
+check('0009: opting out deletes the stored location', (await q('select count(*)::int n from public.donor_locations dl join public.donors d on d.id = dl.donor_id where d.profile_id = $1', [D4]))[0].n === 0);
+
+await as('anon');
+const near10 = await q('select * from public.nearby_donors($1, $2, 10)', [KHI.lat, KHI.lng]);
+const names10 = near10.map((d) => d.full_name);
+check('0009: anonymous nearby search returns opted-in donors within 10 km', names10.includes('geo one') && names10.includes('geo two') && names10.includes('geo five'), JSON.stringify(names10));
+check('0009: donor 40 km away is outside 10 km', !names10.includes('geo three'));
+check('0009: opted-out donor never appears', !names10.includes('geo four'));
+const one = near10.find((d) => d.full_name === 'geo one');
+check('0009: positions are approximate (2 decimals), never exact', one && Number(one.approx_lat) === 24.87 && Number(one.approx_lng) === 67.03, JSON.stringify(one));
+check('0009: no phone / email / exact coordinates in results', near10.every((d) => !('phone' in d) && !('email' in d) && !('latitude' in d) && !('longitude' in d)));
+check('0009: distance computed from the rounded point', one && Math.abs(Number(one.distance_km) - 3.0) < 0.6, String(one?.distance_km));
+check('0009: 50 km radius includes the far donor', (await q('select full_name from public.nearby_donors($1, $2, 50)', [KHI.lat, KHI.lng])).some((d) => d.full_name === 'geo three'));
+check('0009: blood group filter', (await q("select blood_group from public.nearby_donors($1, $2, 10, 'O-')", [KHI.lat, KHI.lng])).every((d) => d.blood_group === 'O-'));
+check('0009: unsupported radius falls back to 10 km', (await q('select full_name from public.nearby_donors($1, $2, 37)', [KHI.lat, KHI.lng])).every((d) => d.full_name !== 'geo three'));
+await expectErr('0009: invalid coordinates rejected', () => q('select * from public.nearby_donors(200, 0, 10)'), /Invalid location/);
+
+// push tokens: D1, D3 have devices; D5 has none
+const tok = (s) => `ExponentPushToken[${s.padEnd(22, 'x')}]`;
+await as('authenticated', D1);
+await expectErr('0009: malformed push token rejected', () => q("select public.register_push_token('not-a-token', 'android')"), /Invalid push token/);
+await expectOk('0009: donor registers an Expo push token', () => q('select public.register_push_token($1, $2)', [tok('d1dev'), 'android']));
+await as('authenticated', D3);
+await q('select public.register_push_token($1, $2)', [tok('d3dev'), 'android']);
+await q('select public.register_push_token($1, $2)', [tok('shared'), 'android']);
+await as('authenticated', D2);
+await q('select public.register_push_token($1, $2)', [tok('shared'), 'android']);
+await as('postgres');
+check('0009: a token that moves to another account is reassigned, not duplicated', (await q('select user_id from public.device_push_tokens where token = $1', [tok('shared')]))[0]?.user_id === D2);
+await q('delete from public.device_push_tokens where token = $1', [tok('shared')]);
+
+// request with a picked location (unverified requester → pending)
+await as('authenticated', RQ);
+await expectErr('0009: request with invalid coordinates rejected', () => q('select * from public.submit_blood_request($1)', [JSON.stringify({ patient_name: 'Geo Patient', blood_group: 'B+', units: 2, urgency: 'urgent', hospital_name: 'Geo Hospital', city: 'Karachi', contact_phone: '+92 300 5550001', latitude: 95, longitude: 67 })]), /Invalid location/);
+const gr = (await q('select * from public.submit_blood_request($1)', [JSON.stringify({ patient_name: 'Geo Patient', blood_group: 'B+', units: 2, urgency: 'urgent', hospital_name: 'Geo Hospital', hospital_address: 'Clifton', city: 'Karachi', contact_phone: '+92 300 5550001', latitude: KHI.lat, longitude: KHI.lng, location_label: 'Geo Hospital, Clifton' })]))[0];
+const mineGeo = (await q('select public.list_requests($1, $2) f', ['mine', gr.id]))[0].f[0];
+check('0009: picked coordinates and label are stored and returned', Number(mineGeo.latitude) === KHI.lat && Number(mineGeo.longitude) === KHI.lng && mineGeo.location_label === 'Geo Hospital, Clifton', JSON.stringify(mineGeo));
+await as('postgres');
+check('0009: pending request queues no alerts', (await q('select count(*)::int n from public.emergency_alerts where request_id = $1', [gr.id]))[0].n === 0);
+await as('anon');
+check('0009: pending request not on the public map', !(await q('select id from public.list_request_locations()')).some((r) => r.id === gr.id));
+
+// admin publishes → matching
+await as('authenticated', ADMIN);
+await q("select public.transition_request_status($1, 'approved')", [gr.id]);
+await as('postgres');
+const alerts = await q('select a.user_id, a.status, a.radius_km, a.distance_km, a.last_error from public.emergency_alerts a where a.request_id = $1', [gr.id]);
+const byUser = Object.fromEntries(alerts.map((a) => [a.user_id, a]));
+check('0009: compatible donor in radius is alerted (queued)', byUser[D1]?.status === 'queued', JSON.stringify(byUser[D1]));
+check('0009: incompatible blood group excluded', !byUser[D2]);
+check('0009: opted-out donor excluded', !byUser[D4]);
+check('0009: requester never alerted', !byUser[RQ]);
+check('0009: escalation widened to 50 km to reach the minimum donors', byUser[D3]?.status === 'queued' && byUser[D3]?.radius_km === 50, JSON.stringify(byUser[D3]));
+check('0009: donor without a device recorded as no_device', byUser[D5]?.status === 'no_device', JSON.stringify(byUser[D5]));
+await as('anon');
+const pubLoc = (await q('select * from public.list_request_locations($1, $2, 25)', [KHI.lat, KHI.lng])).find((r) => r.id === gr.id);
+check('0009: published request on the public map (rounded, no contact)', pubLoc && Number(pubLoc.latitude) === 24.861 && !('contact_phone' in pubLoc), JSON.stringify(pubLoc));
+await as('authenticated', ADMIN);
+await q("select public.transition_request_status($1, 'active')", [gr.id]);
+await as('postgres');
+check('0009: approved → active does not alert anyone twice', (await q('select count(*)::int n from public.emergency_alerts where request_id = $1', [gr.id]))[0].n === alerts.length);
+
+// Edge Function helpers (service_role only)
+await as('anon');
+await expectErr('0009: anon cannot claim alerts', () => q('select * from public._claim_queued_alerts()'), /permission denied/);
+await as('authenticated', D1);
+await expectErr('0009: users cannot claim alerts', () => q('select * from public._claim_queued_alerts()'), /permission denied/);
+await as('service_role');
+const claimed = await q('select * from public._claim_queued_alerts($1, 100)', [gr.id]);
+check('0009: service role claims queued alerts with tokens and request details', claimed.length === 2 && claimed.every((c) => c.tokens.length === 1 && c.blood_group === 'B+'), JSON.stringify(claimed.map((c) => c.tokens)));
+check('0009: claimed alerts are not claimed twice', (await q('select * from public._claim_queued_alerts($1, 100)', [gr.id])).length === 0);
+const c1 = claimed.find((c) => c.user_id === D1);
+const c3 = claimed.find((c) => c.user_id === D3);
+await q('select public._complete_alerts($1)', [JSON.stringify([
+  { alert_id: c1.alert_id, status: 'sent', ticket_ids: ['ticket-1'] },
+  { alert_id: c3.alert_id, status: 'failed', error: 'DeviceNotRegistered', invalid_tokens: [tok('d3dev')] },
+])]);
+await as('postgres');
+const done = Object.fromEntries((await q('select user_id, status, sent_at, last_error from public.emergency_alerts where request_id = $1', [gr.id])).map((a) => [a.user_id, a]));
+check('0009: delivery results recorded (sent / failed with reason)', done[D1].status === 'sent' && done[D1].sent_at && done[D3].status === 'failed' && done[D3].last_error === 'DeviceNotRegistered');
+check('0009: tokens Expo reports as unregistered are deleted', (await q('select count(*)::int n from public.device_push_tokens where token = $1', [tok('d3dev')]))[0].n === 0);
+await as('authenticated', D3);
+check('0009: donors read only their own alerts', (await q('select user_id from public.emergency_alerts')).every((a) => a.user_id === D3));
+
+// admin settings
+await as('authenticated', D1);
+await expectErr('0009: non-admin cannot change alert settings', () => q(`select public.admin_update_alert_settings('{"emergency_radius_km": 25}')`), /Admin access/);
+await as('anon');
+await expectErr('0009: anon cannot read alert settings', () => q('select public.admin_get_alert_settings()'), /permission denied/);
+await as('authenticated', ADMIN);
+await expectErr('0009: out-of-range radius refused', () => q(`select public.admin_update_alert_settings('{"emergency_radius_km": 500}')`), /allowed range/);
+const st = (await q(`select public.admin_update_alert_settings('{"min_donors_before_escalation": 1, "escalation_radii_km": [50, 25]}') s`))[0].s;
+check('0009: admin updates settings (escalation sorted)', st.min_donors_before_escalation === 1 && JSON.stringify(st.escalation_radii_km) === '[25,50]' && st.emergency_radius_km === 10, JSON.stringify(st));
+
+// cooldown + no escalation when the minimum is met + city fallback
+await as('authenticated', RQ);
+const gr2 = (await q('select * from public.submit_blood_request($1)', [JSON.stringify({ patient_name: 'Geo Patient Two', blood_group: 'B+', units: 1, urgency: 'critical', hospital_name: 'Geo Hospital', city: 'Karachi', contact_phone: '+92 300 5550001', latitude: KHI.lat, longitude: KHI.lng })]))[0];
+await as('authenticated', ADMIN);
+await q("select public.transition_request_status($1, 'approved')", [gr2.id]);
+await as('postgres');
+const a2 = Object.fromEntries((await q('select user_id, status, radius_km from public.emergency_alerts where request_id = $1', [gr2.id])).map((a) => [a.user_id, a]));
+check('0009: donor alerted minutes ago is throttled (skipped, cooldown)', a2[D1]?.status === 'skipped', JSON.stringify(a2[D1]));
+check('0009: no escalation once the minimum is met (10 km, far donor not alerted)', a2[D1]?.radius_km === 10 && !a2[D3], JSON.stringify(a2));
+await as('authenticated', RQ);
+const gr3 = (await q('select * from public.submit_blood_request($1)', [JSON.stringify({ patient_name: 'Geo Patient Three', blood_group: 'O+', units: 1, urgency: 'normal', hospital_name: 'City Hospital', city: 'Karachi', contact_phone: '+92 300 5550001' })]))[0];
+await as('authenticated', ADMIN);
+await q("select public.transition_request_status($1, 'approved')", [gr3.id]);
+await as('postgres');
+const a3 = await q('select user_id, radius_km, distance_km from public.emergency_alerts where request_id = $1', [gr3.id]);
+check('0009: request without coordinates falls back to same-city donors', a3.length > 0 && a3.every((a) => a.radius_km === null && a.distance_km === null), JSON.stringify(a3.slice(0, 3)));
+await as('authenticated', ADMIN);
+const stats9 = (await q('select public.admin_alert_stats(7) s'))[0].s;
+check('0009: admin alert stats by status', stats9.by_status.sent >= 1 && stats9.by_status.failed >= 1 && stats9.donors_sharing_location >= 4, JSON.stringify(stats9));
+check('0009: admin sees failed alerts', (await q('select jsonb_array_length(public.admin_list_alert_failures(50)) n'))[0].n >= 1);
+check('0009: admin monitors live requests with alert counts', (await q('select public.admin_list_live_requests_with_alerts() l'))[0].l.some((r) => r.id === gr.id && r.alerts.sent === 1));
+const hosp9 = (await q(`select id, name, address from public.hospitals where name like 'Aga Khan%'`))[0];
+await expectOk('0009: admin sets coordinates when editing a hospital', () => q('select public.admin_upsert_hospital($1)', [JSON.stringify({ id: hosp9.id, name: hosp9.name, type: 'private', address: hosp9.address, city: 'Karachi', latitude: 24.892, longitude: 67.0749 })]));
+check('0009: edited hospital coordinates are stored', (await q(`select (public.list_hospitals(_id => $1::uuid)) -> 0 h`, [hosp9.id]))[0].h.latitude == 24.892);
+await as('authenticated', RQ);
+const atHosp = (await q('select * from public.submit_blood_request($1)', [JSON.stringify({ patient_name: 'Hospital Coords', blood_group: 'A+', hospital_id: hosp9.id, contact_phone: '+92 300 5550001', urgency: 'normal' })]))[0];
+check('0009: request at a known hospital inherits its coordinates', Number((await q('select public.list_requests($1, $2) f', ['mine', atHosp.id]))[0].f[0].latitude) === 24.892);
+
 // ── report ──────────────────────────────────────────────────────────────────
 await as('postgres');
 const pass = results.filter((r) => r[0] === 'PASS').length;

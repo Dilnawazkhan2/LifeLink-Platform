@@ -159,3 +159,22 @@ Realtime applies the same RLS, so a subscriber only receives rows it is allowed 
 | notification actions | `notifications` table + `mark_all_notifications_read` |
 | updateSettings | `notification_preferences.update` |
 | donors / hospitals screens | `search_donors`, `get_donor_details`, `get_donor_contact` (signed-in, logged), `list_hospitals` |
+
+## GPS, maps and emergency alerts (migration 0009)
+
+| Function | Who | Notes |
+|---|---|---|
+| `nearby_donors(_lat, _lng, _radius_km ∈ 5/10/25/50, _blood_group?, _limit?)` | anon, authenticated | Opted-in donors (`nearby_discovery`) with a stored location; `approx_lat/approx_lng` rounded to 2 decimals and `distance_km` measured from the rounded point. No phone/email/exact coordinates |
+| `list_request_locations(_lat?, _lng?, _radius_km?, _limit?)` | anon, authenticated | Published (approved/active) requests with a location, rounded to ~100 m, no contact details |
+| `submit_blood_request(p)` | anon, authenticated | Also accepts `latitude`, `longitude`, `location_label`; a known `hospital_id` lends its coordinates |
+| `set_nearby_discovery(_enabled)` | authenticated | Explicit opt-in; turning it off deletes the stored position |
+| `set_my_location(_lat, _lng, _accuracy_m?, _source 'gps'/'manual')` / `clear_my_location()` | authenticated (donor accounts) | Requires the opt-in |
+| `register_push_token(_token, _platform)` / `unregister_push_token(_token)` | authenticated | Expo push tokens; a token moving to another account is reassigned |
+| `admin_get_alert_settings()` / `admin_update_alert_settings(p)` | staff / admin | radius, escalation radii, minimum donors, max per request, cooldown, on/off, dispatch URL |
+| `admin_alert_stats(_days)`, `admin_list_alert_failures(_limit)`, `admin_list_live_requests_with_alerts()` | staff | Delivery statistics, failures, live requests with alert counts |
+| `_claim_queued_alerts`, `_complete_alerts`, `_alert_dispatch_secret` | service_role only | Used by the `send-emergency-alerts` Edge Function |
+
+Alert matching (trigger on first publish): compatible blood group, available, active donor and profile, `push_enabled`
+(+ `emergency_alerts` unless normal urgency), not the requester; with request coordinates → opted-in donors within the radius,
+widening through the escalation radii until the minimum is met; without coordinates → same city. One alert per donor per
+request; donors pushed within the cooldown → `skipped`; no device → `no_device`.

@@ -13,6 +13,7 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { createClient } from '@supabase/supabase-js';
+import { dispatch as dispatchAlerts } from '../../supabase/functions/send-emergency-alerts/core.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
 const argUrl = process.argv.includes('--url') ? process.argv[process.argv.indexOf('--url') + 1] : null;
@@ -31,7 +32,9 @@ for (let i = 0; i < 120; i++) {
   try { if ((await fetch(URL + '/')).ok) break; } catch { /* starting */ }
   await new Promise((r) => setTimeout(r, 500));
 }
-const KEY = (await (await fetch(URL + '/')).json()).anonKey;
+const INFO = await (await fetch(URL + '/')).json();
+const KEY = INFO.anonKey;
+const SERVICE_KEY = INFO.serviceRoleKeyDevOnly; // local dev server only
 const client = () => createClient(URL, KEY, { auth: { persistSession: false, autoRefreshToken: false } });
 
 // ── tiny test harness ───────────────────────────────────────────────────────
@@ -291,6 +294,79 @@ check('B notified in realtime (donor_availability INSERT → donor list refresh)
 check('B now sees the website donor in the donor list', (await donorNames(userB)).includes('Twoacc Webdonor'));
 bRt.close();
 availRt.close();
+
+// ── extra: GPS nearby donors + emergency push alerts (migration 0009 + Edge Function core) ─
+S('Extra. GPS nearby donors, request locations and emergency alerts');
+const geoTag = Date.now().toString(36);
+const geoUser = async (label, meta) => appSignup(`${label}.${geoTag}`, { account_type: 'both', city: 'Karachi', ...meta });
+const KHI = { lat: 24.8607, lng: 67.0011 };
+const near = (dLat, dLng) => ({ lat: KHI.lat + dLat, lng: KHI.lng + dLng });
+const optIn = async (u, p) => {
+  const a = await u.c.rpc('set_nearby_discovery', { _enabled: true });
+  const b = await u.c.rpc('set_my_location', { _lat: p.lat, _lng: p.lng, _accuracy_m: 20, _source: 'gps' });
+  return a.error?.message ?? b.error?.message ?? null;
+};
+const token = (s) => `ExponentPushToken[e2e${s}${geoTag}xxxxxxxx]`;
+// Test 1 donor: O- ≈3 km · incompatible A+ ≈2 km · O+ ≈60 km · O+ who never opted in
+const gA = await geoUser('geoa', { full_name: 'Geo Donor A', blood_group: 'O-', phone: '+92 300 4440001' });
+const gC = await geoUser('geoc', { full_name: 'Geo Donor C', blood_group: 'A+', phone: '+92 300 4440003' });
+const gD = await geoUser('geod', { full_name: 'Geo Donor D', blood_group: 'O+', phone: '+92 300 4440004' });
+const gE = await geoUser('geoe', { full_name: 'Geo Donor E', blood_group: 'O+', phone: '+92 300 4440005' });
+const gB = await geoUser('geob', { full_name: 'Geo Requester B', blood_group: 'AB+', phone: '+92 300 4440002' });
+check('test 1: donor A enables discovery and shares GPS location', (await optIn(gA, near(0.027, 0))) === null);
+check('setup: incompatible donor C (2 km) and far donor D (60 km) share locations', (await optIn(gC, near(0.018, 0))) === null && (await optIn(gD, near(0.54, 0))) === null);
+for (const [u, t] of [[gA, 'a'], [gC, 'c'], [gD, 'd'], [gE, 'e']]) await u.c.rpc('register_push_token', { _token: token(t), _platform: 'android' });
+check('test 1: donor A device push token registered', !(await gA.c.from('device_push_tokens').select('token')).error);
+
+// Test 5: request with a location picked on the map, from the app (unverified → pending)
+const geoReq = (await ok('test 5: B creates an urgent B+ request with a picked location (app payload)', gB.c.rpc('submit_blood_request', { p: {
+  patient_name: 'Geo E2E Patient', blood_group: 'B+', units: 2, urgency: 'urgent', hospital_name: 'Geo E2E Hospital', hospital_address: 'Clifton',
+  city: 'Karachi', contact_name: 'Geo Requester B', contact_phone: '+92 300 4440002', description: 'e2e location test', source: 'android',
+  latitude: KHI.lat, longitude: KHI.lng, location_label: 'Geo E2E Hospital, Clifton' } })))?.[0];
+const geoMine = ((await gB.c.rpc('list_requests', { _scope: 'mine', _id: geoReq.id })).data ?? [])[0];
+check('test 5: coordinates and label stored and returned to the app', Number(geoMine?.latitude) === KHI.lat && Number(geoMine?.longitude) === KHI.lng && geoMine?.location_label === 'Geo E2E Hospital, Clifton', JSON.stringify(geoMine));
+check('pending request is not on the public map yet', !((await website.rpc('list_request_locations', {})).data ?? []).some((r) => r.id === geoReq.id));
+
+// publish → matching
+await ok('admin publishes the request', admin.rpc('transition_request_status', { _request_id: geoReq.id, _to: 'approved' }));
+const svc = createClient(URL, SERVICE_KEY, { auth: { persistSession: false, autoRefreshToken: false } });
+const alertsFor = async (u) => (await u.c.from('emergency_alerts').select('request_id,status,distance_km,radius_km,last_error').eq('request_id', geoReq.id)).data ?? [];
+const aAlert = (await alertsFor(gA))[0];
+check('test 1: compatible donor A within the radius is queued', aAlert?.status === 'queued' && Number(aAlert.distance_km) < 4, JSON.stringify(aAlert));
+check('test 3: incompatible donor C (A+) is not alerted', (await alertsFor(gC)).length === 0);
+check('test 2: donor D 60 km away (outside even the widest radius) is not alerted', (await alertsFor(gD)).length === 0);
+check('donor E who never opted in to location is not alerted for a located request', (await alertsFor(gE)).length === 0);
+
+// deliver with the Edge Function core against this server (Expo mocked)
+const sentMessages = [];
+const fakeExpo = async (url, init) => {
+  const msgs = JSON.parse(init.body);
+  sentMessages.push(...msgs);
+  return { ok: true, status: 200, json: async () => ({ data: msgs.map((m, i) => ({ status: 'ok', id: `e2e-ticket-${i}` })) }) };
+};
+const alertDb = {
+  secret: async () => 'unused',
+  claim: async (rid, limit) => { const r = await svc.rpc('_claim_queued_alerts', { _request_id: rid, _limit: limit }); if (r.error) throw new Error(r.error.message); return r.data; },
+  complete: async (results) => { const r = await svc.rpc('_complete_alerts', { _results: results }); if (r.error) throw new Error(r.error.message); return r.data; },
+};
+await denied('anonymous visitors cannot claim alerts', website.rpc('_claim_queued_alerts', {}), /permission denied/);
+const summary = await dispatchAlerts({ db: alertDb, fetch: fakeExpo, requestId: geoReq.id });
+const toA = sentMessages.find((m) => m.to === token('a'));
+check('test 1: push message built for donor A (urgent, blood group, deep link)', !!toA && toA.title === 'Urgent: B+ blood needed' && toA.data.request_id === geoReq.id && toA.channelId === 'emergency', JSON.stringify(toA));
+check('test 1/2/3: only donor A was sent a push', summary.sent === 1 && sentMessages.length === 1, JSON.stringify(summary));
+check('delivery recorded as sent for donor A', (await alertsFor(gA))[0]?.status === 'sent');
+await ok('admin activates the request (approved → active)', admin.rpc('transition_request_status', { _request_id: geoReq.id, _to: 'active' }));
+check('no duplicate alert for the same request', (await alertsFor(gA)).length === 1);
+
+// Test 4: disabling discovery removes the donor from nearby results
+const nearbyNames = async (client) => ((await client.rpc('nearby_donors', { _lat: KHI.lat, _lng: KHI.lng, _radius_km: 10 })).data ?? []).map((d) => d.full_name);
+check('donor A is listed nearby (website, anonymous)', (await nearbyNames(website)).includes('Geo Donor A'));
+check('test 7: website (anonymous) and app (signed-in) get the same nearby donors', JSON.stringify((await nearbyNames(website)).sort()) === JSON.stringify((await nearbyNames(zainab)).sort()));
+check('test 7: published request appears on the shared map data', ((await website.rpc('list_request_locations', { _lat: KHI.lat, _lng: KHI.lng, _radius_km: 10 })).data ?? []).some((r) => r.id === geoReq.id));
+await ok('test 4: donor C turns discovery off', gC.c.rpc('set_nearby_discovery', { _enabled: false }));
+check('test 4: donor C no longer appears nearby', !(await nearbyNames(website)).includes('Geo Donor C'));
+const pubDonor = ((await website.rpc('nearby_donors', { _lat: KHI.lat, _lng: KHI.lng, _radius_km: 10 })).data ?? []).find((d) => d.full_name === 'Geo Donor A');
+check('privacy: nearby results carry only rounded positions, no phone/email', pubDonor && Number(pubDonor.approx_lat) === 24.89 && !('phone' in pubDonor) && !('email' in pubDonor) && !('latitude' in pubDonor), JSON.stringify(pubDonor));
 
 // ── report ──────────────────────────────────────────────────────────────────
 for (const c of [adminRt, ahmedRt, websiteAvailRt, invRt]) c.close();
